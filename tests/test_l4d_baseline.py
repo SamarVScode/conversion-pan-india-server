@@ -357,3 +357,70 @@ def test_l4d_baseline_api_auth_and_end_to_end(tmp_path, monkeypatch):
 
     # Cleanup test artifacts from cache
     client.post("/clear-cache", headers=headers)
+
+
+def test_l4d_baseline_single_flight_coalescing(tmp_path, monkeypatch):
+    """Multiple concurrent / repeated requests for the same file_ids coalesce onto the first job_id."""
+    import threading
+    import core.jobs as jobs_mod
+
+    f1 = _write_xlsx(
+        tmp_path / "f1.xlsx",
+        {
+            "Agent_view": [
+                ["Date", "CasperFHRID", "AgentName", "Source_DC"],
+                ["26-11-2026", "FHR201", "Anita", "BLR"],
+            ]
+        },
+    )
+    id1 = "3AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+    id2 = "4AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+    download_calls = {"count": 0}
+    gate = threading.Event()
+
+    def slow_fake_download(url: str, dest_path: Path, job_id=None):
+        download_calls["count"] += 1
+        gate.wait(timeout=2.0)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f1, dest_path)
+        return dest_path
+
+    monkeypatch.setattr(jobs_mod, "download_from_url", slow_fake_download)
+
+    app = create_app()
+    client = TestClient(app)
+    headers = {"X-API-KEY": REQUIRED_API_KEY}
+    client.post("/clear-cache", headers=headers)
+
+    try:
+        # Request 1 starts the single server job
+        r1 = client.post("/l4d-historical-baseline", headers=headers, json={"file_ids": [id1, id2]})
+        assert r1.status_code == 200
+        j1 = r1.json()
+        assert j1.get("deduplicated") is None
+
+        # Request 2 (same IDs in reversed order) coalesces onto j1 instead of spawning a 2nd job
+        r2 = client.post("/l4d-historical-baseline", headers=headers, json={"file_ids": [id2, id1]})
+        assert r2.status_code == 200
+        j2 = r2.json()
+        assert j2["job_id"] == j1["job_id"]
+        assert j2.get("deduplicated") is True
+
+        gate.set()
+        for _ in range(40):
+            st = client.get(f"/job/{j1['job_id']}", headers=headers).json()
+            if st["status"] in ("done", "error"):
+                break
+            time.sleep(0.1)
+
+        assert st["status"] == "done"
+        # Request 3 after completion returns cached result with same job_id without re-downloading
+        r3 = client.post("/l4d-historical-baseline", headers=headers, json={"file_ids": [id1, id2]})
+        assert r3.status_code == 200
+        assert r3.json()["job_id"] == j1["job_id"]
+        assert r3.json()["deduplicated"] is True
+        # Only the 2 files from Request 1 were downloaded (not 6)
+        assert download_calls["count"] == 2
+    finally:
+        gate.set()
+        client.post("/clear-cache", headers=headers)

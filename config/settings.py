@@ -26,6 +26,10 @@ CACHE_MAX_AGE = int(os.getenv("CACHE_MAX_AGE", "7200"))  # 2 hours job metadata 
 
 # Concurrency Containment: Defaults to 1 for 512MB RAM free instances
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "1"))
+MAX_QUEUED_JOBS = int(os.getenv("MAX_QUEUED_JOBS", "2"))
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "250"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+UPLOAD_CHUNK_BYTES = 1024 * 1024  # 1 MB streaming chunks
 
 log.info(f"CACHE_DIR: {CACHE_DIR}")
-log.info(f"MAX_CONCURRENT_JOBS: {MAX_CONCURRENT_JOBS}")
+log.info(f"MAX_CONCURRENT_JOBS: {MAX_CONCURRENT_JOBS}, MAX_QUEUED_JOBS: {MAX_QUEUED_JOBS}, MAX_UPLOAD_MB: {MAX_UPLOAD_MB}")

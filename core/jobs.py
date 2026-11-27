@@ -1,6 +1,7 @@
 import uuid
 import time
 import json
+import hashlib
 import logging
 import threading
 import re
@@ -12,7 +13,13 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 from fastapi import HTTPException
 
-from config.settings import CACHE_DIR, CACHE_TTL, CACHE_MAX_AGE, MAX_CONCURRENT_JOBS
+from config.settings import (
+    CACHE_DIR,
+    CACHE_TTL,
+    CACHE_MAX_AGE,
+    MAX_CONCURRENT_JOBS,
+    MAX_QUEUED_JOBS,
+)
 from core.downloader import extract_file_id, download_from_url
 from core.logger import (
     print_job_start,
@@ -159,10 +166,37 @@ def generate_proper_report_filename(
     return f"{prefix}_{gen_date_str}.xlsx"
 
 
+def _cleanup_upload_inputs(file_id: str) -> None:
+    if not str(file_id).startswith("upload_"):
+        return
+    for path in CACHE_DIR.glob(f"{file_id}.*"):
+        if path.suffix.lower() not in (".json", ".log") and not path.name.startswith("REPORT_"):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def ensure_queue_capacity() -> None:
+    """Rejects new heavy jobs with HTTP 429 once in-flight + queued jobs hit MAX_CONCURRENT_JOBS + MAX_QUEUED_JOBS."""
+    max_total = max(1, MAX_CONCURRENT_JOBS + max(0, MAX_QUEUED_JOBS))
+    with _jobs_lock:
+        in_flight = sum(1 for j in active_jobs.values() if j.get("status") in ("processing", "queued"))
+    if in_flight >= max_total:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Server busy: {in_flight} jobs already active/queued (limit {max_total}). "
+                "Please retry in a moment."
+            ),
+        )
+
+
 def background_report_job(job_id: str, file_id: str, output_path: Path) -> None:
     log_job_message(job_id, f"Waiting for execution lock (Max concurrent: {MAX_CONCURRENT_JOBS})...")
     acquired = conversion_semaphore.acquire(timeout=600)
     if not acquired:
+        _cleanup_upload_inputs(file_id)
         job = active_jobs.get(job_id, {})
         job["status"] = "error"
         job["error"] = "Server busy: concurrent limit reached."
@@ -331,6 +365,14 @@ def create_report_job(drive_url: str, sub_type: Optional[str] = None) -> Dict[st
         return {"job_id": cache_key, "status": "done"}
 
     job_id = cache_key
+    with _jobs_lock:
+        existing = active_jobs.get(job_id)
+        if existing and existing.get("status") in ("processing", "queued"):
+            log_job_message(job_id, "Coalescing concurrent conversion request onto existing in-flight job.")
+            return {"job_id": job_id, "status": existing.get("status", "processing"), "deduplicated": True}
+
+    ensure_queue_capacity()
+
     job = {
         "status": "processing",
         "output_path": str(output_path),
@@ -350,19 +392,31 @@ def create_report_job(drive_url: str, sub_type: Optional[str] = None) -> Dict[st
 
 
 def create_upload_report_job(
-    file_bytes: bytes,
+    file_bytes: Optional[bytes] = None,
     filename: str = "upload.xlsx",
     sub_type: Optional[str] = None,
+    staged_path: Optional[Path] = None,
+    job_id: Optional[str] = None,
+    file_size: Optional[int] = None,
 ) -> Dict[str, str]:
     evict_old_jobs()
-    job_id = str(uuid.uuid4())[:8]
-    file_id = f"upload_{job_id}"
-    log.info(f"Creating upload stream job {job_id} (filename={filename}, size={len(file_bytes)} bytes)")
+    ensure_queue_capacity()
 
-    ext = Path(filename).suffix.lower() if filename and Path(filename).suffix else ".xlsx"
-    tmp_input = CACHE_DIR / f"{file_id}{ext}"
-    with open(tmp_input, "wb") as f:
-        f.write(file_bytes)
+    job_id = job_id or str(uuid.uuid4())[:8]
+    file_id = f"upload_{job_id}"
+
+    if staged_path is not None:
+        tmp_input = Path(staged_path)
+        size_bytes = file_size if file_size is not None else (tmp_input.stat().st_size if tmp_input.exists() else 0)
+    else:
+        payload = file_bytes or b""
+        size_bytes = len(payload)
+        ext = Path(filename).suffix.lower() if filename and Path(filename).suffix else ".xlsx"
+        tmp_input = CACHE_DIR / f"{file_id}{ext}"
+        with open(tmp_input, "wb") as f:
+            f.write(payload)
+
+    log.info(f"Creating upload stream job {job_id} (filename={filename}, size={size_bytes} bytes)")
 
     output_path = CACHE_DIR / f"REPORT_{job_id}.xlsx"
     formatted_name = generate_proper_report_filename(original_filename=filename, sub_type=sub_type)
@@ -378,7 +432,7 @@ def create_upload_report_job(
         "file_name": formatted_name,
     }
     _set_job(job_id, job)
-    log_job_message(job_id, f"Upload received: {filename} ({len(file_bytes)} bytes). Starting generator...")
+    log_job_message(job_id, f"Upload received: {filename} ({size_bytes} bytes). Starting generator...")
 
     process_job_async(job_id, file_id, output_path)
     return {"job_id": job_id, "status": "processing"}
@@ -486,20 +540,68 @@ def create_l4d_baseline_job(
     access_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     evict_old_jobs()
-    job_id = str(uuid.uuid4())[:8]
-    output_path = CACHE_DIR / f"L4D_BASELINE_{job_id}.json"
 
-    job = {
-        "status": "processing",
-        "output_path": str(output_path),
-        "error": None,
-        "progress": "Job created, waiting to download files...",
-        "created_at": time.time(),
-        "report_type": "l4d_baseline",
-        "file_count": len(file_ids),
-        "tabs": ["Agent_view"],
-    }
-    _set_job(job_id, job)
+    canonical_ids = sorted({extract_file_id(fid) for fid in file_ids if str(fid or "").strip()})
+    baseline_key = hashlib.sha256("|".join(canonical_ids).encode("utf-8")).hexdigest()[:12]
+    max_total = max(1, MAX_CONCURRENT_JOBS + max(0, MAX_QUEUED_JOBS))
+
+    with _jobs_lock:
+        # 1. Single-flight / Coalesce: if same file_ids set is already processing OR done within CACHE_TTL,
+        # return the existing job_id without queuing a duplicate job on Render.
+        for existing_id, existing_job in active_jobs.items():
+            if existing_job.get("report_type") != "l4d_baseline":
+                continue
+            if existing_job.get("baseline_key") != baseline_key:
+                continue
+
+            status = existing_job.get("status")
+            if status in ("processing", "queued"):
+                log_job_message(existing_id, "Coalescing duplicate L4D baseline request onto active job.")
+                return {
+                    "job_id": existing_id,
+                    "status": status,
+                    "file_count": len(file_ids),
+                    "deduplicated": True,
+                }
+            if status == "done":
+                out_p = Path(existing_job.get("output_path", ""))
+                age = time.time() - existing_job.get("completed_at", existing_job.get("created_at", 0))
+                if out_p.exists() and age <= CACHE_TTL:
+                    log_job_message(existing_id, "Serving fresh cached L4D baseline job (deduplicated).")
+                    return {
+                        "job_id": existing_id,
+                        "status": "done",
+                        "file_count": len(file_ids),
+                        "deduplicated": True,
+                    }
+
+        in_flight = sum(1 for j in active_jobs.values() if j.get("status") in ("processing", "queued"))
+        if in_flight >= max_total:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Server busy: {in_flight} jobs already active/queued (limit {max_total}). "
+                    "Please retry in a moment."
+                ),
+            )
+
+        job_id = str(uuid.uuid4())[:8]
+        output_path = CACHE_DIR / f"L4D_BASELINE_{job_id}.json"
+
+        job = {
+            "status": "processing",
+            "output_path": str(output_path),
+            "error": None,
+            "progress": "Job created, waiting to download files...",
+            "created_at": time.time(),
+            "report_type": "l4d_baseline",
+            "baseline_key": baseline_key,
+            "file_count": len(file_ids),
+            "tabs": ["Agent_view"],
+        }
+        active_jobs[job_id] = job
+
+    _save_job(job_id, job)
     log_job_message(job_id, f"Initialized L4D baseline job for {len(file_ids)} file(s).")
 
     thread = threading.Thread(

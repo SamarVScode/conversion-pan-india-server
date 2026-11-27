@@ -224,3 +224,45 @@ def test_api_end_to_end_integration():
     r_clear = client.post("/clear-cache", headers=headers)
     assert r_clear.status_code == 200
     assert r_clear.json()["status"] == "ok"
+
+
+def test_upload_size_limit_and_queue_capacity_guards(monkeypatch):
+    """Oversized streaming uploads return 413 and excess concurrent jobs return 429 cleanly."""
+    import api.routes as routes_mod
+    import core.jobs as jobs_mod
+    from config.settings import CACHE_DIR
+
+    app = create_app()
+    client = TestClient(app)
+    headers = {"X-API-KEY": REQUIRED_API_KEY}
+    client.post("/clear-cache", headers=headers)
+
+    try:
+        # 1. Size limit guard (413) with partial file cleanup
+        monkeypatch.setattr(routes_mod, "MAX_UPLOAD_BYTES", 50)
+        monkeypatch.setattr(routes_mod, "UPLOAD_CHUNK_BYTES", 20)
+        before_uploads = set(CACHE_DIR.glob("upload_*"))
+        r_big = client.post(
+            "/convert-upload",
+            headers=headers,
+            files={"file": ("too_big.xlsx", b"X" * 120, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        )
+        assert r_big.status_code == 413
+        assert set(CACHE_DIR.glob("upload_*")) == before_uploads
+
+        # 2. Queue capacity guard (429) when MAX_CONCURRENT_JOBS + MAX_QUEUED_JOBS reached
+        monkeypatch.setattr(jobs_mod, "MAX_CONCURRENT_JOBS", 1)
+        monkeypatch.setattr(jobs_mod, "MAX_QUEUED_JOBS", 0)
+        with jobs_mod._jobs_lock:
+            jobs_mod.active_jobs["busy_1"] = {"status": "processing", "created_at": time.time()}
+
+        r_busy = client.post(
+            "/convert-upload",
+            headers=headers,
+            files={"file": ("small.xlsx", b"abc", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        )
+        assert r_busy.status_code == 429
+    finally:
+        with jobs_mod._jobs_lock:
+            jobs_mod.active_jobs.pop("busy_1", None)
+        client.post("/clear-cache", headers=headers)

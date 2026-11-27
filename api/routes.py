@@ -1,12 +1,13 @@
 import json
 import logging
+import uuid
 from pathlib import Path
 from typing import List, Optional
 from fastapi import APIRouter, Depends, Query, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from config.settings import CACHE_DIR
+from config.settings import CACHE_DIR, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, UPLOAD_CHUNK_BYTES
 from core.auth import verify_api_key
 from core.jobs import (
     create_report_job,
@@ -82,8 +83,51 @@ async def convert_upload(
     sub_type: Optional[str] = Query(None, description="Report sub-type (e.g. sameday, d1)"),
     x_api_key: Optional[str] = Depends(verify_api_key),
 ):
-    content = await file.read()
-    return create_upload_report_job(content, file.filename or "upload.xlsx", sub_type=sub_type)
+    from core.jobs import ensure_queue_capacity
+
+    # Fail fast before writing upload bytes to disk if server queue is already full
+    ensure_queue_capacity()
+
+    job_id = str(uuid.uuid4())[:8]
+    filename = file.filename or "upload.xlsx"
+    ext = Path(filename).suffix.lower() if Path(filename).suffix else ".xlsx"
+    staged_path = CACHE_DIR / f"upload_{job_id}{ext}"
+
+    total_bytes = 0
+    try:
+        CACHE_DIR.mkdir(exist_ok=True, parents=True)
+        with open(staged_path, "wb") as out_f:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Uploaded file exceeds maximum allowed size of {MAX_UPLOAD_MB} MB.",
+                    )
+                out_f.write(chunk)
+    except HTTPException:
+        staged_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        staged_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Failed to stream uploaded file: {exc}")
+    finally:
+        await file.close()
+
+    try:
+        return create_upload_report_job(
+            filename=filename,
+            sub_type=sub_type,
+            staged_path=staged_path,
+            job_id=job_id,
+            file_size=total_bytes,
+        )
+    except Exception:
+        staged_path.unlink(missing_ok=True)
+        raise
 
 
 @router.get("/job/{job_id}")
