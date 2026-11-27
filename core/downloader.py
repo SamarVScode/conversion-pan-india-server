@@ -179,7 +179,11 @@ def _save_stream_to_file(response: requests.Response, dest_path: Path, job_id: O
         for chunk in response.iter_content(chunk_size=32768):
             if chunk:
                 f.write(chunk)
-    _validate_downloaded_file(dest_path)
+    try:
+        _validate_downloaded_file(dest_path)
+    except Exception:
+        dest_path.unlink(missing_ok=True)
+        raise
     size_mb = dest_path.stat().st_size / 1024 / 1024
     _log(job_id, f"Saved to disk: '{dest_path.name}' ({size_mb:.2f} MB)")
     return dest_path
@@ -187,7 +191,7 @@ def _save_stream_to_file(response: requests.Response, dest_path: Path, job_id: O
 
 def download_from_url(url: str, dest_path: Path, job_id: Optional[str] = None) -> Path:
     """
-    Download a Google Drive file to disk using a 4-stage cascade.
+    Download a Google Drive file to disk using a 5-stage cascade.
     Works with or without an OAuth access_token in the URL.
     """
     token = _extract_token_from_url(url)
@@ -212,6 +216,23 @@ def download_from_url(url: str, dest_path: Path, job_id: Optional[str] = None) -
             _log(job_id, f"  Method 1 returned HTTP {resp.status_code}, trying next...")
         except Exception as e:
             _log(job_id, f"  Method 1 failed: {e}", "WARNING")
+
+    # Method 1b: Google Sheets direct export fallback (handles >10 MB Sheets and link-shared Sheets)
+    sheets_export_url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
+    _log(job_id, "Method 1b: Trying Google Sheets direct export (format=xlsx)...")
+    try:
+        resp = session.get(
+            sheets_export_url,
+            headers=auth_headers,
+            stream=True,
+            timeout=180,
+            allow_redirects=True,
+        )
+        if _inspect_response(resp, "sheets-export", job_id):
+            return _save_stream_to_file(resp, dest_path, job_id=job_id)
+        _log(job_id, f"  Method 1b returned HTTP {resp.status_code}, trying next...")
+    except Exception as e:
+        _log(job_id, f"  Method 1b failed: {e}", "WARNING")
 
     # Method 2: Drive API v3 alt=media (binary files)
     if token:
@@ -276,7 +297,7 @@ def download_from_url(url: str, dest_path: Path, job_id: Optional[str] = None) -
     except Exception as e:
         _log(job_id, f"  Method 4 failed: {e}", "WARNING")
 
-    _log(job_id, "ALL 4 DOWNLOAD METHODS FAILED. File cannot be retrieved.", "ERROR")
+    _log(job_id, "ALL 5 DOWNLOAD METHODS FAILED. File cannot be retrieved.", "ERROR")
     raise HTTPException(
         status_code=400,
         detail=(
