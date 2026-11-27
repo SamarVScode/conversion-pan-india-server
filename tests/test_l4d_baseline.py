@@ -60,29 +60,35 @@ def test_multi_day_aggregation_and_cleanup(tmp_path):
                 ["Date", "CasperFHRID", "AgentName", "Source_DC", "DC"],
                 ["24-11-2026", 1001.0, "Rahul Old", "BLR", "BLR"],
                 ["24-11-2026", "FHR200", "Priya", "MUM", "MUM"],
+                ["24-11-2026", "FHR400", "Vikram Old", "ABT", "ABT-OLD"],
+                ["24-11-2026", "N/A", "Invalid NA", "BLR", "BLR"],
+                ["24-11-2026", "0", "Invalid Zero", "BLR", "BLR"],
+                ["24-11-2026", 0, "Invalid Zero Num", "BLR", "BLR"],
             ],
         },
     )
 
-    # Day 2: Sameday Agent_View (middle) - FHR1001 not present, FHR200 present, FHR300 only DC col
+    # Day 2: Sameday Agent_View (middle) - FHR200 lowercase/padded, FHR300 only DC col with car-khr
     day2 = _write_xlsx(
         tmp_path / "day2.xlsx",
         {
             "Sameday Agent_View": [
                 ["Date", "CasperID", "AgentName", "DC"],
-                ["2026-11-25", "FHR200", "Priya", "HYD"],
-                ["2026-11-25", "FHR300", "Amit", "CHE"],
+                ["2026-11-25", " fhr200 ", "Priya", "HYD"],
+                ["2026-11-25", "FHR300", "Amit", "car-khr"],
+                ["2026-11-25", "n/a", "Invalid Lower NA", "CHE"],
             ],
         },
     )
 
-    # Day 3: CSV (newest) - 1001 moved to car-khr -> normalized CAR
+    # Day 3: CSV (newest) - 1001 moved to car-khr -> source_dc CAR, mini_dc CAR-KHR; fhr400 -> ABT / ABT-ABR
     day3 = _write_csv(
         tmp_path / "day3.csv",
         [
             ["Date", "CasperFHRID", "AgentName", "Source_DC", "DC"],
-            ["26/11/2026", "1001", "Rahul New", "car-khr", "BLR"],
+            ["26/11/2026", "1001", "Rahul New", "car-khr", "car-khr"],
             ["26/11/2026", "FHR200", "Priya", "MUM", "MUM"],
+            ["26/11/2026", "fhr400", "Vikram New", "ABT", "abt-abr"],
         ],
     )
 
@@ -94,36 +100,129 @@ def test_multi_day_aggregation_and_cleanup(tmp_path):
     assert not day3.exists()
 
     assert result["success"] is True
-    assert result["total_agents"] == 3
+    assert result["total_agents"] == 4
     assert result["dates_processed"] == ["2026-11-26", "2026-11-25", "2026-11-24"]
 
     by_id = {row[0]: row for row in result["rows"]}
+    assert "N/A" not in by_id
+    assert "0" not in by_id
 
-    # 1001: active 26 & 24, latest Source_DC normalized from car-khr -> CAR, latest name Rahul New
+    # 1001: active 26 & 24, latest source_dc normalized from car-khr -> CAR, mini_dc CAR-KHR
     assert by_id["1001"] == [
         "1001",
         "Rahul New",
         "CAR",
+        "CAR-KHR",
         "2026-11-26",
         "2026-11-24",
         "2026-11-26,2026-11-24",
     ]
 
-    # FHR200: active 26, 25, 24; latest Source_DC MUM
+    # FHR200: active 26, 25, 24 (normalized from " fhr200 "); latest source_dc/mini_dc MUM
     assert by_id["FHR200"] == [
         "FHR200",
         "Priya",
+        "MUM",
         "MUM",
         "2026-11-26",
         "2026-11-25",
         "2026-11-26,2026-11-25,2026-11-24",
     ]
 
-    # FHR300: active only on 25, prevActiveDate is ""
+    # FHR400: active 26 & 24, latest mini_dc ABT-ABR alongside source_dc ABT
+    assert by_id["FHR400"] == [
+        "FHR400",
+        "Vikram New",
+        "ABT",
+        "ABT-ABR",
+        "2026-11-26",
+        "2026-11-24",
+        "2026-11-26,2026-11-24",
+    ]
+
+    # FHR300: active only on 25 with only DC column = car-khr -> source_dc CAR, mini_dc CAR-KHR
     assert by_id["FHR300"] == [
         "FHR300",
         "Amit",
-        "CHE",
+        "CAR",
+        "CAR-KHR",
+        "2026-11-25",
+        "",
+        "2026-11-25",
+    ]
+
+
+def test_mini_dc_header_variants_and_latest_date_tracking(tmp_path):
+    # Pass newest date first and oldest second to verify latest_date wins regardless of file order
+    newer = _write_xlsx(
+        tmp_path / "newer.xlsx",
+        {
+            "Agent_view": [
+                ["Date", "CasperFHRID", "AgentName", "Source_DC", "Mini DC"],
+                ["26-11-2026", "FHR501", "Suresh Latest", "ABT", "ABT-ABR"],
+                ["26-11-2026", "FHR502", "Meena", "car-khr", None],
+            ]
+        },
+    )
+    older = _write_xlsx(
+        tmp_path / "older.xlsx",
+        {
+            "Agent_view": [
+                ["Date", "CasperFHRID", "AgentName", "Source_DC"],
+                ["24-11-2026", "fhr501", "Suresh Old", "BLR"],
+                ["24-11-2026", "FHR503", "Rohan", "car-khr"],
+            ]
+        },
+    )
+    sub_dc_file = _write_xlsx(
+        tmp_path / "subdc.xlsx",
+        {
+            "Agent_view": [
+                ["Date", "CasperFHRID", "AgentName", "Sub DC", "Source_DC"],
+                ["25-11-2026", "FHR504", "Divya", "ABT-KRN", "ABT"],
+            ]
+        },
+    )
+
+    result = aggregate_l4d_baseline([newer, older, sub_dc_file], delete_after_read=False)
+    by_id = {row[0]: row for row in result["rows"]}
+
+    # FHR501 keeps newer date metadata (ABT / ABT-ABR), not overwritten by older file (BLR)
+    assert by_id["FHR501"] == [
+        "FHR501",
+        "Suresh Latest",
+        "ABT",
+        "ABT-ABR",
+        "2026-11-26",
+        "2026-11-24",
+        "2026-11-26,2026-11-24",
+    ]
+    # FHR502 blank Mini DC falls back to raw Source_DC uppercased (CAR-KHR)
+    assert by_id["FHR502"] == [
+        "FHR502",
+        "Meena",
+        "CAR",
+        "CAR-KHR",
+        "2026-11-26",
+        "",
+        "2026-11-26",
+    ]
+    # FHR503 has only Source_DC=car-khr -> mini_dc_idx is distinct (-1) and falls back to CAR-KHR
+    assert by_id["FHR503"] == [
+        "FHR503",
+        "Rohan",
+        "CAR",
+        "CAR-KHR",
+        "2026-11-24",
+        "",
+        "2026-11-24",
+    ]
+    # FHR504 resolves Sub DC column even when placed before Source_DC
+    assert by_id["FHR504"] == [
+        "FHR504",
+        "Divya",
+        "ABT",
+        "ABT-KRN",
         "2026-11-25",
         "",
         "2026-11-25",
@@ -141,10 +240,15 @@ def test_real_d1_report_if_present():
     assert result["total_agents"] > 0
     assert result["dates_processed"] == ["2026-11-26"]
     first_row = result["rows"][0]
-    assert len(first_row) == 6
-    assert first_row[3] == "2026-11-26"
-    assert first_row[4] == ""
-    assert first_row[5] == "2026-11-26"
+    assert len(first_row) == 7
+    assert first_row[4] == "2026-11-26"
+    assert first_row[5] == ""
+    assert first_row[6] == "2026-11-26"
+
+    by_id = {row[0]: row for row in result["rows"]}
+    assert by_id["15227"][2] == "ABT"
+    assert by_id["15227"][3] == "ABT-ABR"
+    assert any(row[2] == "ABT" and row[3] == "ABT-ABR" for row in result["rows"])
 
 
 def test_l4d_baseline_api_auth_and_end_to_end(tmp_path, monkeypatch):
@@ -161,9 +265,9 @@ def test_l4d_baseline_api_auth_and_end_to_end(tmp_path, monkeypatch):
         tmp_path / "f2.xlsx",
         {
             "D-1 Agent_View": [
-                ["Date", "CasperFHRID", "AgentName", "Source_DC"],
-                ["26-11-2026", "FHR101", "Rahul", "car_khr"],
-                ["26-11-2026", "FHR102", "Kiran", "HYD"],
+                ["Date", "CasperFHRID", "AgentName", "Source_DC", "DC"],
+                ["26-11-2026", "FHR101", "Rahul", "car-khr", "CAR-KHR"],
+                ["26-11-2026", "FHR102", "Kiran", "ABT", "ABT-ABR"],
             ]
         },
     )
@@ -244,8 +348,8 @@ def test_l4d_baseline_api_auth_and_end_to_end(tmp_path, monkeypatch):
     assert res_json["dates_processed"] == ["2026-11-26", "2026-11-25"]
 
     by_id = {r[0]: r for r in res_json["rows"]}
-    assert by_id["FHR101"] == ["FHR101", "Rahul", "CAR", "2026-11-26", "2026-11-25", "2026-11-26,2026-11-25"]
-    assert by_id["FHR102"] == ["FHR102", "Kiran", "HYD", "2026-11-26", "", "2026-11-26"]
+    assert by_id["FHR101"] == ["FHR101", "Rahul", "CAR", "CAR-KHR", "2026-11-26", "2026-11-25", "2026-11-26,2026-11-25"]
+    assert by_id["FHR102"] == ["FHR102", "Kiran", "ABT", "ABT-ABR", "2026-11-26", "", "2026-11-26"]
 
     # Verify access_token was passed to downloader
     assert len(seen_urls) == 2

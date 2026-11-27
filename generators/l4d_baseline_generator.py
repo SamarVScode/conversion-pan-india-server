@@ -17,9 +17,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Union
 
 from config.dc_config import normalize_dc_code
-from core.stream_engine import ColumnFinder, get_sheet_names, open_stream_reader
+from core.stream_engine import ColumnFinder, _clean_key, get_sheet_names, open_stream_reader
 
 log = logging.getLogger("conversion_report_server.l4d_baseline")
+
+_MINI_DC_HEADERS = ("dc", "mini dc", "mini_dc", "sub dc", "dc_code", "dc code")
+_MINI_DC_FALLBACKS = ("minidc", "subdc", "dccode")
 
 _DATE_FORMATS = (
     "%Y-%m-%d",
@@ -72,22 +75,44 @@ def normalize_iso_date(val: Any) -> Optional[str]:
 
 
 def _normalize_casper_id(val: Any) -> str:
-    """Normalize CasperFHRID / CasperID to a clean string without trailing '.0'."""
+    """Normalize CasperFHRID / CasperID to uppercase string without trailing '.0', skipping N/A and 0."""
     if val is None or isinstance(val, bool):
         return ""
     if isinstance(val, int):
-        return str(val)
-    if isinstance(val, float):
+        s = str(val)
+    elif isinstance(val, float):
         if math.isnan(val) or math.isinf(val):
             return ""
-        return str(int(val)) if val.is_integer() else str(val)
+        s = str(int(val)) if val.is_integer() else str(val)
+    else:
+        s = str(val)
 
-    s = str(val).strip()
-    if not s or s.lower() in ("none", "nan", "nat", "null"):
-        return ""
+    s = s.strip().upper()
     if re.fullmatch(r"\d+\.0+", s):
-        return s.split(".", 1)[0]
+        s = s.split(".", 1)[0]
+    if not s or s in ("NONE", "NAN", "NAT", "NULL", "N/A", "0"):
+        return ""
     return s
+
+
+def _find_mini_dc_idx(headers: List[Any], exclude_idx: int = -1) -> int:
+    """Detect Mini_DC / DC column index, distinct from Source_DC when present."""
+    raw_pairs = [
+        (idx, str(h).strip().lower(), _clean_key(h))
+        for idx, h in enumerate(headers)
+        if h is not None and idx != exclude_idx
+    ]
+    for cand in _MINI_DC_HEADERS:
+        cand_raw = cand.strip().lower()
+        cand_clean = _clean_key(cand)
+        for idx, h_raw, h_clean in raw_pairs:
+            if h_raw == cand_raw or (cand_clean and h_clean == cand_clean):
+                return idx
+    for fb in _MINI_DC_FALLBACKS:
+        for idx, _, h_clean in raw_pairs:
+            if fb in h_clean:
+                return idx
+    return -1
 
 
 def _find_agent_view_sheet(file_path: Path) -> Optional[str]:
@@ -115,7 +140,7 @@ def aggregate_l4d_baseline(
             "success": True,
             "total_agents": int,
             "dates_processed": List[str],  # sorted YYYY-MM-DD descending
-            "rows": List[List[str]],       # [casperId, agentName, sourceDC, lastActiveDate, prevActiveDate, activeDatesCSV]
+            "rows": List[List[str]],       # [casperId, agentName, sourceDC, miniDC, lastActiveDate, prevActiveDate, activeDatesCSV]
         }
     """
     paths = [Path(p) for p in file_paths]
@@ -153,17 +178,19 @@ def aggregate_l4d_baseline(
                     ["AgentName", "Agent_Name", "Agent Name", "Name"],
                     default=-1,
                 )
-                dc_idx = finder.find(
+                source_dc_idx = finder.find(
                     ["Source_DC", "Source DC", "SourceDC"],
                     fallback_keywords=["sourcedc"],
                     default=-1,
                 )
+                dc_idx = source_dc_idx
                 if dc_idx < 0:
                     dc_idx = finder.find(
                         ["DC", "DC_Code", "DC Code"],
                         fallback_keywords=["dc"],
                         default=-1,
                     )
+                mini_dc_idx = _find_mini_dc_idx(headers, exclude_idx=source_dc_idx)
 
                 if date_idx < 0 or casper_idx < 0:
                     log.warning(
@@ -193,6 +220,19 @@ def aggregate_l4d_baseline(
 
                     raw_dc = row[dc_idx] if (0 <= dc_idx < row_len) else None
                     source_dc = normalize_dc_code(raw_dc)
+                    raw_dc_clean = str(raw_dc or "").strip().upper()
+                    if raw_dc_clean in ("NONE", "NAN", "NAT", "NULL"):
+                        raw_dc_clean = ""
+
+                    mini_dc = (
+                        str(row[mini_dc_idx] or "").strip().upper()
+                        if 0 <= mini_dc_idx < row_len
+                        else ""
+                    )
+                    if mini_dc in ("NONE", "NAN", "NAT", "NULL"):
+                        mini_dc = ""
+                    if not mini_dc:
+                        mini_dc = raw_dc_clean or source_dc
 
                     dates_processed.add(norm_date)
 
@@ -203,6 +243,7 @@ def aggregate_l4d_baseline(
                             "latest_date": norm_date,
                             "agent_name": agent_name,
                             "source_dc": source_dc,
+                            "mini_dc": mini_dc,
                         }
                     else:
                         entry["dates"].add(norm_date)
@@ -210,11 +251,14 @@ def aggregate_l4d_baseline(
                             entry["latest_date"] = norm_date
                             entry["agent_name"] = agent_name
                             entry["source_dc"] = source_dc
+                            entry["mini_dc"] = mini_dc
                         elif norm_date == entry["latest_date"]:
                             if agent_name:
                                 entry["agent_name"] = agent_name
                             if source_dc:
                                 entry["source_dc"] = source_dc
+                            if mini_dc:
+                                entry["mini_dc"] = mini_dc
 
             if progress_cb:
                 progress_cb(idx, total_files, path)
@@ -236,13 +280,14 @@ def aggregate_l4d_baseline(
             casper_id,
             entry["agent_name"],
             entry["source_dc"],
+            entry["mini_dc"],
             last_active,
             prev_active,
             active_csv,
         ])
 
-    rows.sort(key=lambda r: (r[3], r[0]), reverse=False)
-    rows.sort(key=lambda r: r[3], reverse=True)
+    rows.sort(key=lambda r: (r[4], r[0]), reverse=False)
+    rows.sort(key=lambda r: r[4], reverse=True)
 
     return {
         "success": True,
